@@ -71,6 +71,7 @@ class Hyperparameters:
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
+    bottleneck_dim: int = int(os.environ.get("BOTTLENECK_DIM", os.environ.get("MODEL_DIM", 512)))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
@@ -397,10 +398,10 @@ def unet_stage_counts(num_layers: int) -> tuple[int, int, int]:
 
 
 class CausalDownsample(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, out_dim: int):
         super().__init__()
         self.norm = RMSNormNoWeight()
-        self.proj = CastedLinear(2 * dim, dim)
+        self.proj = CastedLinear(2 * dim, out_dim)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.norm(x)
@@ -413,10 +414,10 @@ class CausalDownsample(nn.Module):
 
 
 class RepeatUpsample(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, out_dim: int):
         super().__init__()
         self.norm = RMSNormNoWeight()
-        self.proj = CastedLinear(dim, dim)
+        self.proj = CastedLinear(dim, out_dim)
 
     def __call__(self, x: mx.array, target_len: int) -> mx.array:
         x = self.proj(self.norm(x))
@@ -431,7 +432,7 @@ class GPT(nn.Module):
     # - low-resolution bottleneck
     # - repeat upsample + gated full-resolution decoder
     # - tied embeddings for the LM head (the baseline default setup)
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+    def __init__(self, vocab_size: int, num_layers: int, dim: int, bottleneck_dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, skip_gate_init: float, skip_softcap: float,
                  rope_base: float, tied_embed_init_std: float, qk_gain_init: float):
         super().__init__()
@@ -439,10 +440,14 @@ class GPT(nn.Module):
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         if skip_softcap <= 0.0:
             raise ValueError(f"skip_softcap must be positive, got {skip_softcap}")
+        if bottleneck_dim <= 0:
+            raise ValueError(f"bottleneck_dim must be positive, got {bottleneck_dim}")
         self.num_layers = num_layers
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
         self.skip_softcap = skip_softcap
+        self.model_dim = dim
+        self.bottleneck_dim = bottleneck_dim
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_encoder_layers, self.num_bottleneck_layers, self.num_decoder_layers = unet_stage_counts(num_layers)
@@ -452,12 +457,12 @@ class GPT(nn.Module):
             Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
             for _ in range(self.num_encoder_layers)
         ]
-        self.downsample = CausalDownsample(dim)
+        self.downsample = CausalDownsample(dim, bottleneck_dim)
         self.bottleneck_blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(bottleneck_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
             for _ in range(self.num_bottleneck_layers)
         ]
-        self.upsample = RepeatUpsample(dim)
+        self.upsample = RepeatUpsample(bottleneck_dim, dim)
         self.decoder_blocks = [
             Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
             for _ in range(self.num_decoder_layers)
@@ -972,6 +977,7 @@ def main() -> None:
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         dim=args.model_dim,
+        bottleneck_dim=args.bottleneck_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
@@ -1018,12 +1024,13 @@ def main() -> None:
     log(f"tokenizer_path:{args.tokenizer_path}")
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
-        f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
+        f"dim:{args.model_dim} bottleneck_dim:{args.bottleneck_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
     log(
         f"architecture:causal_unet encoder_layers:{model.num_encoder_layers} "
         f"bottleneck_layers:{model.num_bottleneck_layers} decoder_layers:{model.num_decoder_layers} "
+        f"model_dim:{args.model_dim} bottleneck_dim:{args.bottleneck_dim} "
         f"skip_fusion:tanh_gate skip_softcap:{args.skip_softcap}"
     )
     log(

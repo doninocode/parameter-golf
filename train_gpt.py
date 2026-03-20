@@ -64,6 +64,7 @@ class Hyperparameters:
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
+    bottleneck_dim = int(os.environ.get("BOTTLENECK_DIM", os.environ.get("MODEL_DIM", 512)))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -678,10 +679,10 @@ def unet_stage_counts(num_layers: int) -> tuple[int, int, int]:
 class CausalDownsample(nn.Module):
     # Halve sequence length causally by pairing each even-position token with its
     # immediate predecessor. Low-res token n therefore only sees positions <= 2n.
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, out_dim: int):
         super().__init__()
         self.norm = RMSNorm()
-        self.proj = CastedLinear(2 * dim, dim, bias=False)
+        self.proj = CastedLinear(2 * dim, out_dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.norm(x)
@@ -694,10 +695,10 @@ class CausalDownsample(nn.Module):
 class RepeatUpsample(nn.Module):
     # Restore full resolution by projecting low-res features and repeating each
     # token over its 2-position causal window.
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, out_dim: int):
         super().__init__()
         self.norm = RMSNorm()
-        self.proj = CastedLinear(dim, dim, bias=False)
+        self.proj = CastedLinear(dim, out_dim, bias=False)
 
     def forward(self, x: Tensor, target_len: int) -> Tensor:
         x = self.proj(self.norm(x))
@@ -710,6 +711,7 @@ class GPT(nn.Module):
         vocab_size: int,
         num_layers: int,
         model_dim: int,
+        bottleneck_dim: int,
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
@@ -726,11 +728,15 @@ class GPT(nn.Module):
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         if skip_softcap <= 0.0:
             raise ValueError(f"skip_softcap must be positive, got {skip_softcap}")
+        if bottleneck_dim <= 0:
+            raise ValueError(f"bottleneck_dim must be positive, got {bottleneck_dim}")
         self.num_layers = num_layers
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.skip_softcap = skip_softcap
+        self.model_dim = model_dim
+        self.bottleneck_dim = bottleneck_dim
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         (
             self.num_encoder_layers,
@@ -742,11 +748,11 @@ class GPT(nn.Module):
         self.encoder_blocks = nn.ModuleList(
             [Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init) for _ in range(self.num_encoder_layers)]
         )
-        self.downsample = CausalDownsample(model_dim)
+        self.downsample = CausalDownsample(model_dim, bottleneck_dim)
         self.bottleneck_blocks = nn.ModuleList(
-            [Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init) for _ in range(self.num_bottleneck_layers)]
+            [Block(bottleneck_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init) for _ in range(self.num_bottleneck_layers)]
         )
-        self.upsample = RepeatUpsample(model_dim)
+        self.upsample = RepeatUpsample(bottleneck_dim, model_dim)
         self.decoder_blocks = nn.ModuleList(
             [Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init) for _ in range(self.num_decoder_layers)]
         )
@@ -857,14 +863,14 @@ class BatchedTTTLoRA(nn.Module):
     """All LoRA adapters for one batch: LM head and Q/V per block."""
     def __init__(self, bsz: int, model: GPT, rank: int):
         super().__init__()
-        dim = model.tok_emb.embedding_dim
         vocab = model.tok_emb.num_embeddings
-        self.lm_head_lora = BatchedLinearLoRA(bsz, dim, vocab, rank)
+        self.lm_head_lora = BatchedLinearLoRA(bsz, model.model_dim, vocab, rank)
         self.q_loras = nn.ModuleList()
         self.v_loras = nn.ModuleList()
         for block in model.iter_blocks():
-            self.q_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_q.weight.shape[0], rank))
-            self.v_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_v.weight.shape[0], rank))
+            in_dim = block.attn.c_q.weight.shape[1]
+            self.q_loras.append(BatchedLinearLoRA(bsz, in_dim, block.attn.c_q.weight.shape[0], rank))
+            self.v_loras.append(BatchedLinearLoRA(bsz, in_dim, block.attn.c_v.weight.shape[0], rank))
 
     def reset(self) -> None:
         for m in self.modules():
@@ -1139,6 +1145,7 @@ def main() -> None:
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         model_dim=args.model_dim,
+        bottleneck_dim=args.bottleneck_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
@@ -1213,6 +1220,7 @@ def main() -> None:
     log0(
         f"architecture:causal_unet encoder_layers:{base_model.num_encoder_layers} "
         f"bottleneck_layers:{base_model.num_bottleneck_layers} decoder_layers:{base_model.num_decoder_layers} "
+        f"model_dim:{args.model_dim} bottleneck_dim:{args.bottleneck_dim} "
         f"skip_fusion:tanh_gate skip_softcap:{args.skip_softcap}"
     )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
