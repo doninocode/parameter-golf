@@ -67,8 +67,11 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    mirror_tie_layers = bool(int(os.environ.get("MIRROR_TIE_LAYERS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    skip_gate_init = float(os.environ.get("SKIP_GATE_INIT", 0.0))
+    skip_softcap = float(os.environ.get("SKIP_SOFTCAP", 6.0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -296,7 +299,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gate,skip_gates",
     ).split(",")
     if pattern
 )
@@ -658,6 +661,19 @@ class Block(nn.Module):
         return x
 
 
+def softcap_tensor(x: Tensor, cap: float) -> Tensor:
+    return cap * torch.tanh(x / cap)
+
+
+def build_block_index_map(num_layers: int, mirror_tie_layers: bool) -> tuple[int, tuple[int, ...]]:
+    if num_layers <= 0:
+        raise ValueError(f"num_layers must be positive, got {num_layers}")
+    if not mirror_tie_layers:
+        return num_layers, tuple(range(num_layers))
+    block_indices = tuple(min(i, num_layers - 1 - i) for i in range(num_layers))
+    return max(block_indices) + 1, block_indices
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -668,23 +684,32 @@ class GPT(nn.Module):
         num_kv_heads: int,
         mlp_mult: int,
         tie_embeddings: bool,
+        mirror_tie_layers: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
+        skip_gate_init: float,
+        skip_softcap: float,
         rope_base: float,
         qk_gain_init: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if skip_softcap <= 0.0:
+            raise ValueError(f"skip_softcap must be positive, got {skip_softcap}")
+        self.num_layers = num_layers
         self.tie_embeddings = tie_embeddings
+        self.mirror_tie_layers = mirror_tie_layers
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.skip_softcap = skip_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
+        self.skip_gates = nn.Parameter(torch.full((self.num_skip_weights, model_dim), skip_gate_init, dtype=torch.float32))
+        self.num_unique_blocks, self.block_indices = build_block_index_map(num_layers, mirror_tie_layers)
+        self.shared_blocks = nn.ModuleList(
             [
                 Block(
                     model_dim,
@@ -694,7 +719,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for _ in range(self.num_unique_blocks)
             ]
         )
         self.final_norm = RMSNorm()
@@ -702,6 +727,12 @@ class GPT(nn.Module):
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
+
+    def block_for_layer(self, layer_idx: int) -> Block:
+        return self.shared_blocks[self.block_indices[layer_idx]]
+
+    def stored_skip(self, x: Tensor) -> Tensor:
+        return softcap_tensor(F.rms_norm(x, (x.size(-1),)), self.skip_softcap)
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -716,26 +747,27 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            qd = lora.q_loras[i] if lora else None
-            vd = lora.v_loras[i] if lora else None
-            x = self.blocks[i](x, x0, qd, vd)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            qd = lora.q_loras[bi] if lora else None
-            vd = lora.v_loras[bi] if lora else None
-            x = self.blocks[bi](x, x0, qd, vd)
+        # First half stores normalized, softly capped skips; second half reuses them in reverse order.
+        for layer_idx in range(self.num_encoder_layers):
+            qd = lora.q_loras[layer_idx] if lora else None
+            vd = lora.v_loras[layer_idx] if lora else None
+            x = self.block_for_layer(layer_idx)(x, x0, qd, vd)
+            skips.append(self.stored_skip(x))
+        for skip_idx in range(self.num_decoder_layers):
+            layer_idx = self.num_encoder_layers + skip_idx
+            if skip_idx < self.num_skip_weights:
+                gate = torch.tanh(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
+                x = x + gate * skips.pop()
+            qd = lora.q_loras[layer_idx] if lora else None
+            vd = lora.v_loras[layer_idx] if lora else None
+            x = self.block_for_layer(layer_idx)(x, x0, qd, vd)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits = F.linear(x, self.tok_emb.weight)
         else:
             logits = self.lm_head(x)
         logits = logits + (lora.lm_head_lora(x) if lora else 0)
-        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        logits = softcap_tensor(logits, self.logit_softcap)
         if lora:
             bsz, sl, V = logits.shape
             return F.cross_entropy(
@@ -780,7 +812,8 @@ class BatchedTTTLoRA(nn.Module):
         self.lm_head_lora = BatchedLinearLoRA(bsz, dim, vocab, rank)
         self.q_loras = nn.ModuleList()
         self.v_loras = nn.ModuleList()
-        for block in model.blocks:
+        for layer_idx in range(model.num_layers):
+            block = model.block_for_layer(layer_idx)
             self.q_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_q.weight.shape[0], rank))
             self.v_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_v.weight.shape[0], rank))
 
@@ -1061,8 +1094,11 @@ def main() -> None:
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings,
+        mirror_tie_layers=args.mirror_tie_layers,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
+        skip_gate_init=args.skip_gate_init,
+        skip_softcap=args.skip_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
@@ -1080,7 +1116,7 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    block_named_params = list(base_model.shared_blocks.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1091,8 +1127,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    if base_model.skip_gates.numel() > 0:
+        scalar_params.append(base_model.skip_gates)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1126,6 +1162,10 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log0(
+        f"architecture:mirror_tie_layers:{args.mirror_tie_layers} unique_blocks:{base_model.num_unique_blocks} "
+        f"skip_fusion:tanh_gate skip_softcap:{args.skip_softcap}"
+    )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")

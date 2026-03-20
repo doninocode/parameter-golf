@@ -75,9 +75,12 @@ class Hyperparameters:
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    mirror_tie_layers: bool = bool(int(os.environ.get("MIRROR_TIE_LAYERS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    skip_gate_init: float = float(os.environ.get("SKIP_GATE_INIT", 0.0))
+    skip_softcap: float = float(os.environ.get("SKIP_SOFTCAP", 6.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -124,7 +127,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gate,skip_gates",
     ).split(",")
     if pattern
 )
@@ -379,57 +382,80 @@ class Block(nn.Module):
         return x
 
 
+def softcap_array(x: mx.array, cap: float) -> mx.array:
+    return cap * mx.tanh(x / cap)
+
+
+def build_block_index_map(num_layers: int, mirror_tie_layers: bool) -> tuple[int, tuple[int, ...]]:
+    if num_layers <= 0:
+        raise ValueError(f"num_layers must be positive, got {num_layers}")
+    if not mirror_tie_layers:
+        return num_layers, tuple(range(num_layers))
+    block_indices = tuple(min(i, num_layers - 1 - i) for i in range(num_layers))
+    return max(block_indices) + 1, block_indices
+
+
 class GPT(nn.Module):
     # - token embedding + RMSNorm
-    # - encoder half accumulates skip tensors
-    # - decoder half consumes reversed skips with learned skip_weights
+    # - encoder half accumulates normalized, softly capped skip tensors
+    # - decoder half consumes reversed skips with tanh-gated fusion
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 logit_chunk_tokens: int, logit_softcap: float, skip_gate_init: float, skip_softcap: float,
+                 mirror_tie_layers: bool, rope_base: float, tied_embed_init_std: float, qk_gain_init: float):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if skip_softcap <= 0.0:
+            raise ValueError(f"skip_softcap must be positive, got {skip_softcap}")
+        self.num_layers = num_layers
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.mirror_tie_layers = mirror_tie_layers
+        self.skip_softcap = skip_softcap
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
-        self.blocks = [
+        self.skip_gates = mx.ones((self.num_skip_weights, dim), dtype=mx.float32) * skip_gate_init
+        self.num_unique_blocks, self.block_indices = build_block_index_map(num_layers, mirror_tie_layers)
+        self.shared_blocks = [
             Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_layers)
+            for _ in range(self.num_unique_blocks)
         ]
         self.final_norm = RMSNormNoWeight()
 
-        for b in self.blocks:
+        for b in self.shared_blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
             b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
 
+    def block_for_layer(self, layer_idx: int) -> Block:
+        return self.shared_blocks[self.block_indices[layer_idx]]
+
+    def stored_skip(self, x: mx.array) -> mx.array:
+        return softcap_array(rms_norm(x), self.skip_softcap)
+
     def softcap(self, logits: mx.array) -> mx.array:
-        c = self.logit_softcap
-        return c * mx.tanh(logits / c)
+        return softcap_array(logits, self.logit_softcap)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
         skips: list[mx.array] = []
 
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
-            if skips:
-                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        for layer_idx in range(self.num_encoder_layers):
+            x = self.block_for_layer(layer_idx)(x, x0)
+            skips.append(self.stored_skip(x))
+        for skip_idx in range(self.num_decoder_layers):
+            layer_idx = self.num_encoder_layers + skip_idx
+            if skip_idx < self.num_skip_weights:
+                gate = mx.tanh(self.skip_gates[skip_idx]).astype(x.dtype)[None, None, :]
+                x = x + gate * skips.pop()
+            x = self.block_for_layer(layer_idx)(x, x0)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -485,7 +511,7 @@ class Muon:
 class SplitOptimizers:
     # - embeddings: Adam with the tied-embedding LR
     # - block matrices (2D): Muon
-    # - block scalars + skip weights: Adam
+    # - block scalars + skip gates: Adam
     # This preserves the high-level optimization behavior even though MLX internals differ.
     def __init__(self, model: GPT, args: Hyperparameters):
         self.args = args
@@ -494,12 +520,12 @@ class SplitOptimizers:
         self.matrix_keys = [
             k
             for k, p in params.items()
-            if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            if k.startswith("shared_blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if k == "skip_gates" or (k.startswith("shared_blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -833,6 +859,12 @@ def clip_grad_tree(grads_tree: dict, max_norm: float) -> dict:
     return tree_unflatten([(k, g * scale) for k, g in flat.items()])
 
 
+def flatten_array_state(state: dict) -> dict[str, mx.array]:
+    # MLX state can include small static Python metadata from the module tree. The
+    # artifact boundary should only contain array-valued tensors.
+    return {k: v for k, v in tree_flatten(state) if hasattr(v, "dtype")}
+
+
 def main() -> None:
     # ==============================================================================
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -894,6 +926,9 @@ def main() -> None:
         mlp_mult=args.mlp_mult,
         logit_chunk_tokens=args.logit_chunk_tokens,
         logit_softcap=args.logit_softcap,
+        skip_gate_init=args.skip_gate_init,
+        skip_softcap=args.skip_softcap,
+        mirror_tie_layers=args.mirror_tie_layers,
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
@@ -937,6 +972,10 @@ def main() -> None:
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
     log(
+        f"architecture:mirror_tie_layers:{args.mirror_tie_layers} unique_blocks:{model.num_unique_blocks} "
+        f"skip_fusion:tanh_gate skip_softcap:{args.skip_softcap}"
+    )
+    log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
         f"val_batch_size:{args.val_batch_size} "
@@ -953,8 +992,8 @@ def main() -> None:
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
-        f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
-        f"skip_weights:{model.skip_weights.dtype}"
+        f"linear_weight:{model.shared_blocks[0].attn.c_q.weight.dtype} "
+        f"skip_gates:{model.skip_gates.dtype}"
     )
 
     # ==============================================================================
@@ -1063,7 +1102,7 @@ def main() -> None:
     # quantized roundtrip directly by loading the dequantized tensors back into the
     # model and running one final validation pass.
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
-    flat_state = {k: v for k, v in tree_flatten(model.state)}
+    flat_state = flatten_array_state(model.state)
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
