@@ -67,7 +67,6 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
-    mirror_tie_layers = bool(int(os.environ.get("MIRROR_TIE_LAYERS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     skip_gate_init = float(os.environ.get("SKIP_GATE_INIT", 0.0))
@@ -665,13 +664,44 @@ def softcap_tensor(x: Tensor, cap: float) -> Tensor:
     return cap * torch.tanh(x / cap)
 
 
-def build_block_index_map(num_layers: int, mirror_tie_layers: bool) -> tuple[int, tuple[int, ...]]:
-    if num_layers <= 0:
-        raise ValueError(f"num_layers must be positive, got {num_layers}")
-    if not mirror_tie_layers:
-        return num_layers, tuple(range(num_layers))
-    block_indices = tuple(min(i, num_layers - 1 - i) for i in range(num_layers))
-    return max(block_indices) + 1, block_indices
+def unet_stage_counts(num_layers: int) -> tuple[int, int, int]:
+    if num_layers < 3:
+        raise ValueError(f"num_layers must be at least 3 for the causal U-Net, got {num_layers}")
+    bottleneck_layers = max(1, num_layers // 3)
+    encoder_layers = max(1, (num_layers - bottleneck_layers) // 2)
+    decoder_layers = num_layers - encoder_layers - bottleneck_layers
+    if decoder_layers <= 0:
+        raise ValueError(f"num_layers={num_layers} leaves no decoder layers for the causal U-Net")
+    return encoder_layers, bottleneck_layers, decoder_layers
+
+
+class CausalDownsample(nn.Module):
+    # Halve sequence length causally by pairing each even-position token with its
+    # immediate predecessor. Low-res token n therefore only sees positions <= 2n.
+    def __init__(self, dim: int):
+        super().__init__()
+        self.norm = RMSNorm()
+        self.proj = CastedLinear(2 * dim, dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.norm(x)
+        current = x[:, 0::2, :]
+        prev = x[:, 1::2, :]
+        prev = F.pad(prev, (0, 0, 1, 0))[:, : current.size(1), :]
+        return self.proj(torch.cat((prev, current), dim=-1))
+
+
+class RepeatUpsample(nn.Module):
+    # Restore full resolution by projecting low-res features and repeating each
+    # token over its 2-position causal window.
+    def __init__(self, dim: int):
+        super().__init__()
+        self.norm = RMSNorm()
+        self.proj = CastedLinear(dim, dim, bias=False)
+
+    def forward(self, x: Tensor, target_len: int) -> Tensor:
+        x = self.proj(self.norm(x))
+        return x.repeat_interleave(2, dim=1)[:, :target_len, :]
 
 
 class GPT(nn.Module):
@@ -684,7 +714,6 @@ class GPT(nn.Module):
         num_kv_heads: int,
         mlp_mult: int,
         tie_embeddings: bool,
-        mirror_tie_layers: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
         skip_gate_init: float,
@@ -699,28 +728,27 @@ class GPT(nn.Module):
             raise ValueError(f"skip_softcap must be positive, got {skip_softcap}")
         self.num_layers = num_layers
         self.tie_embeddings = tie_embeddings
-        self.mirror_tie_layers = mirror_tie_layers
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.skip_softcap = skip_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_gates = nn.Parameter(torch.full((self.num_skip_weights, model_dim), skip_gate_init, dtype=torch.float32))
-        self.num_unique_blocks, self.block_indices = build_block_index_map(num_layers, mirror_tie_layers)
-        self.shared_blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for _ in range(self.num_unique_blocks)
-            ]
+        (
+            self.num_encoder_layers,
+            self.num_bottleneck_layers,
+            self.num_decoder_layers,
+        ) = unet_stage_counts(num_layers)
+        self.num_skip_connections = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_gates = nn.Parameter(torch.full((self.num_skip_connections, model_dim), skip_gate_init, dtype=torch.float32))
+        self.encoder_blocks = nn.ModuleList(
+            [Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init) for _ in range(self.num_encoder_layers)]
+        )
+        self.downsample = CausalDownsample(model_dim)
+        self.bottleneck_blocks = nn.ModuleList(
+            [Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init) for _ in range(self.num_bottleneck_layers)]
+        )
+        self.upsample = RepeatUpsample(model_dim)
+        self.decoder_blocks = nn.ModuleList(
+            [Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init) for _ in range(self.num_decoder_layers)]
         )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -728,8 +756,17 @@ class GPT(nn.Module):
             self.lm_head._zero_init = True
         self._init_weights()
 
-    def block_for_layer(self, layer_idx: int) -> Block:
-        return self.shared_blocks[self.block_indices[layer_idx]]
+    def iter_blocks(self):
+        yield from self.encoder_blocks
+        yield from self.bottleneck_blocks
+        yield from self.decoder_blocks
+
+    def named_trunk_parameters(self):
+        yield from self.encoder_blocks.named_parameters(prefix="encoder_blocks")
+        yield from self.downsample.named_parameters(prefix="downsample")
+        yield from self.bottleneck_blocks.named_parameters(prefix="bottleneck_blocks")
+        yield from self.upsample.named_parameters(prefix="upsample")
+        yield from self.decoder_blocks.named_parameters(prefix="decoder_blocks")
 
     def stored_skip(self, x: Tensor) -> Tensor:
         return softcap_tensor(F.rms_norm(x, (x.size(-1),)), self.skip_softcap)
@@ -746,21 +783,34 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
+        layer_idx = 0
 
-        # First half stores normalized, softly capped skips; second half reuses them in reverse order.
-        for layer_idx in range(self.num_encoder_layers):
+        for block in self.encoder_blocks:
             qd = lora.q_loras[layer_idx] if lora else None
             vd = lora.v_loras[layer_idx] if lora else None
-            x = self.block_for_layer(layer_idx)(x, x0, qd, vd)
+            x = block(x, x0, qd, vd)
             skips.append(self.stored_skip(x))
-        for skip_idx in range(self.num_decoder_layers):
-            layer_idx = self.num_encoder_layers + skip_idx
-            if skip_idx < self.num_skip_weights:
+            layer_idx += 1
+
+        x = self.downsample(x)
+        x_low0 = self.downsample(x0)
+
+        for block in self.bottleneck_blocks:
+            qd = lora.q_loras[layer_idx] if lora else None
+            vd = lora.v_loras[layer_idx] if lora else None
+            x = block(x, x_low0, qd, vd)
+            layer_idx += 1
+
+        x = self.upsample(x, target_len=input_ids.size(1))
+
+        for skip_idx, block in enumerate(self.decoder_blocks):
+            if skip_idx < self.num_skip_connections:
                 gate = torch.tanh(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
                 x = x + gate * skips.pop()
             qd = lora.q_loras[layer_idx] if lora else None
             vd = lora.v_loras[layer_idx] if lora else None
-            x = self.block_for_layer(layer_idx)(x, x0, qd, vd)
+            x = block(x, x0, qd, vd)
+            layer_idx += 1
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits = F.linear(x, self.tok_emb.weight)
@@ -812,8 +862,7 @@ class BatchedTTTLoRA(nn.Module):
         self.lm_head_lora = BatchedLinearLoRA(bsz, dim, vocab, rank)
         self.q_loras = nn.ModuleList()
         self.v_loras = nn.ModuleList()
-        for layer_idx in range(model.num_layers):
-            block = model.block_for_layer(layer_idx)
+        for block in model.iter_blocks():
             self.q_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_q.weight.shape[0], rank))
             self.v_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_v.weight.shape[0], rank))
 
@@ -1094,7 +1143,6 @@ def main() -> None:
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings,
-        mirror_tie_layers=args.mirror_tie_layers,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         skip_gate_init=args.skip_gate_init,
@@ -1114,9 +1162,9 @@ def main() -> None:
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
+    # - matrix params in the U-Net trunk use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.shared_blocks.named_parameters())
+    block_named_params = list(base_model.named_trunk_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1163,7 +1211,8 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(
-        f"architecture:mirror_tie_layers:{args.mirror_tie_layers} unique_blocks:{base_model.num_unique_blocks} "
+        f"architecture:causal_unet encoder_layers:{base_model.num_encoder_layers} "
+        f"bottleneck_layers:{base_model.num_bottleneck_layers} decoder_layers:{base_model.num_decoder_layers} "
         f"skip_fusion:tanh_gate skip_softcap:{args.skip_softcap}"
     )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")

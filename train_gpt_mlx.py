@@ -75,7 +75,6 @@ class Hyperparameters:
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
-    mirror_tie_layers: bool = bool(int(os.environ.get("MIRROR_TIE_LAYERS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -386,23 +385,55 @@ def softcap_array(x: mx.array, cap: float) -> mx.array:
     return cap * mx.tanh(x / cap)
 
 
-def build_block_index_map(num_layers: int, mirror_tie_layers: bool) -> tuple[int, tuple[int, ...]]:
-    if num_layers <= 0:
-        raise ValueError(f"num_layers must be positive, got {num_layers}")
-    if not mirror_tie_layers:
-        return num_layers, tuple(range(num_layers))
-    block_indices = tuple(min(i, num_layers - 1 - i) for i in range(num_layers))
-    return max(block_indices) + 1, block_indices
+def unet_stage_counts(num_layers: int) -> tuple[int, int, int]:
+    if num_layers < 3:
+        raise ValueError(f"num_layers must be at least 3 for the causal U-Net, got {num_layers}")
+    bottleneck_layers = max(1, num_layers // 3)
+    encoder_layers = max(1, (num_layers - bottleneck_layers) // 2)
+    decoder_layers = num_layers - encoder_layers - bottleneck_layers
+    if decoder_layers <= 0:
+        raise ValueError(f"num_layers={num_layers} leaves no decoder layers for the causal U-Net")
+    return encoder_layers, bottleneck_layers, decoder_layers
+
+
+class CausalDownsample(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.norm = RMSNormNoWeight()
+        self.proj = CastedLinear(2 * dim, dim)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x = self.norm(x)
+        current = x[:, 0::2, :]
+        prev = x[:, 1::2, :]
+        prev_len = current.shape[1]
+        pad = mx.zeros((x.shape[0], 1, x.shape[2]), dtype=x.dtype)
+        prev = mx.concatenate([pad, prev], axis=1)[:, :prev_len, :]
+        return self.proj(mx.concatenate([prev, current], axis=-1))
+
+
+class RepeatUpsample(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.norm = RMSNormNoWeight()
+        self.proj = CastedLinear(dim, dim)
+
+    def __call__(self, x: mx.array, target_len: int) -> mx.array:
+        x = self.proj(self.norm(x))
+        x = mx.repeat(x, 2, axis=1)
+        return x[:, :target_len, :]
 
 
 class GPT(nn.Module):
     # - token embedding + RMSNorm
-    # - encoder half accumulates normalized, softly capped skip tensors
-    # - decoder half consumes reversed skips with tanh-gated fusion
+    # - full-resolution encoder
+    # - causal downsample to half resolution
+    # - low-resolution bottleneck
+    # - repeat upsample + gated full-resolution decoder
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, skip_gate_init: float, skip_softcap: float,
-                 mirror_tie_layers: bool, rope_base: float, tied_embed_init_std: float, qk_gain_init: float):
+                 rope_base: float, tied_embed_init_std: float, qk_gain_init: float):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -411,30 +442,34 @@ class GPT(nn.Module):
         self.num_layers = num_layers
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
-        self.mirror_tie_layers = mirror_tie_layers
         self.skip_softcap = skip_softcap
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_gates = mx.ones((self.num_skip_weights, dim), dtype=mx.float32) * skip_gate_init
-        self.num_unique_blocks, self.block_indices = build_block_index_map(num_layers, mirror_tie_layers)
-        self.shared_blocks = [
+        self.num_encoder_layers, self.num_bottleneck_layers, self.num_decoder_layers = unet_stage_counts(num_layers)
+        self.num_skip_connections = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_gates = mx.ones((self.num_skip_connections, dim), dtype=mx.float32) * skip_gate_init
+        self.encoder_blocks = [
             Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for _ in range(self.num_unique_blocks)
+            for _ in range(self.num_encoder_layers)
+        ]
+        self.downsample = CausalDownsample(dim)
+        self.bottleneck_blocks = [
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            for _ in range(self.num_bottleneck_layers)
+        ]
+        self.upsample = RepeatUpsample(dim)
+        self.decoder_blocks = [
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            for _ in range(self.num_decoder_layers)
         ]
         self.final_norm = RMSNormNoWeight()
 
-        for b in self.shared_blocks:
+        for b in [*self.encoder_blocks, *self.bottleneck_blocks, *self.decoder_blocks]:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
             b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
-
-    def block_for_layer(self, layer_idx: int) -> Block:
-        return self.shared_blocks[self.block_indices[layer_idx]]
 
     def stored_skip(self, x: mx.array) -> mx.array:
         return softcap_array(rms_norm(x), self.skip_softcap)
@@ -447,15 +482,23 @@ class GPT(nn.Module):
         x0 = x
         skips: list[mx.array] = []
 
-        for layer_idx in range(self.num_encoder_layers):
-            x = self.block_for_layer(layer_idx)(x, x0)
+        for block in self.encoder_blocks:
+            x = block(x, x0)
             skips.append(self.stored_skip(x))
-        for skip_idx in range(self.num_decoder_layers):
-            layer_idx = self.num_encoder_layers + skip_idx
-            if skip_idx < self.num_skip_weights:
+
+        x = self.downsample(x)
+        x_low0 = self.downsample(x0)
+
+        for block in self.bottleneck_blocks:
+            x = block(x, x_low0)
+
+        x = self.upsample(x, int(input_ids.shape[1]))
+
+        for skip_idx, block in enumerate(self.decoder_blocks):
+            if skip_idx < self.num_skip_connections:
                 gate = mx.tanh(self.skip_gates[skip_idx]).astype(x.dtype)[None, None, :]
                 x = x + gate * skips.pop()
-            x = self.block_for_layer(layer_idx)(x, x0)
+            x = block(x, x0)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -510,7 +553,7 @@ class Muon:
 
 class SplitOptimizers:
     # - embeddings: Adam with the tied-embedding LR
-    # - block matrices (2D): Muon
+    # - U-Net trunk matrices (2D): Muon
     # - block scalars + skip gates: Adam
     # This preserves the high-level optimization behavior even though MLX internals differ.
     def __init__(self, model: GPT, args: Hyperparameters):
@@ -520,12 +563,20 @@ class SplitOptimizers:
         self.matrix_keys = [
             k
             for k, p in params.items()
-            if k.startswith("shared_blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            if any(
+                k.startswith(prefix)
+                for prefix in ("encoder_blocks.", "downsample.", "bottleneck_blocks.", "upsample.", "decoder_blocks.")
+            )
+            and p.ndim == 2
+            and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_gates" or (k.startswith("shared_blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if k == "skip_gates" or (
+                any(k.startswith(prefix) for prefix in ("encoder_blocks.", "downsample.", "bottleneck_blocks.", "upsample.", "decoder_blocks."))
+                and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS))
+            )
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -928,7 +979,6 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         skip_gate_init=args.skip_gate_init,
         skip_softcap=args.skip_softcap,
-        mirror_tie_layers=args.mirror_tie_layers,
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
@@ -972,7 +1022,8 @@ def main() -> None:
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
     log(
-        f"architecture:mirror_tie_layers:{args.mirror_tie_layers} unique_blocks:{model.num_unique_blocks} "
+        f"architecture:causal_unet encoder_layers:{model.num_encoder_layers} "
+        f"bottleneck_layers:{model.num_bottleneck_layers} decoder_layers:{model.num_decoder_layers} "
         f"skip_fusion:tanh_gate skip_softcap:{args.skip_softcap}"
     )
     log(
@@ -992,7 +1043,7 @@ def main() -> None:
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
-        f"linear_weight:{model.shared_blocks[0].attn.c_q.weight.dtype} "
+        f"linear_weight:{model.encoder_blocks[0].attn.c_q.weight.dtype} "
         f"skip_gates:{model.skip_gates.dtype}"
     )
 
