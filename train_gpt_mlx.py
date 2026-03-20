@@ -72,6 +72,7 @@ class Hyperparameters:
     num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     bottleneck_dim: int = int(os.environ.get("BOTTLENECK_DIM", os.environ.get("MODEL_DIM", 512)))
+    unet_resample_kernel: int = int(os.environ.get("UNET_RESAMPLE_KERNEL", 4))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
@@ -127,7 +128,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gate,skip_gates",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gate,skip_gates,filter_logit,filter_logits,phase_scale,phase_scales,phase_bias,phase_biases,phase_gate",
     ).split(",")
     if pattern
 )
@@ -398,31 +399,56 @@ def unet_stage_counts(num_layers: int) -> tuple[int, int, int]:
 
 
 class CausalDownsample(nn.Module):
-    def __init__(self, dim: int, out_dim: int):
+    def __init__(self, dim: int, out_dim: int, kernel_size: int):
         super().__init__()
+        if kernel_size < 2:
+            raise ValueError(f"kernel_size must be at least 2, got {kernel_size}")
         self.norm = RMSNormNoWeight()
-        self.proj = CastedLinear(2 * dim, out_dim)
+        self.kernel_size = kernel_size
+        self.out_dim = out_dim
+        self.proj = CastedLinear(dim, 2 * out_dim)
+        filter_init = np.zeros((kernel_size, dim), dtype=np.float32)
+        filter_init[-1].fill(2.0)
+        filter_init[-2].fill(1.0)
+        self.filter_logits = mx.array(filter_init, dtype=mx.float32)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.norm(x)
-        current = x[:, 0::2, :]
-        prev = x[:, 1::2, :]
-        prev_len = current.shape[1]
-        pad = mx.zeros((x.shape[0], 1, x.shape[2]), dtype=x.dtype)
-        prev = mx.concatenate([pad, prev], axis=1)[:, :prev_len, :]
-        return self.proj(mx.concatenate([prev, current], axis=-1))
+        out_len = (int(x.shape[1]) + 1) // 2
+        pad = mx.zeros((x.shape[0], self.kernel_size - 1, x.shape[2]), dtype=x.dtype)
+        padded = mx.concatenate([pad, x], axis=1)
+        weights = mx.softmax(self.filter_logits, axis=0).astype(x.dtype)
+        filtered = None
+        for tap in range(self.kernel_size):
+            tap_slice = padded[:, tap : tap + 2 * out_len : 2, :]
+            contrib = tap_slice * weights[tap][None, None, :]
+            filtered = contrib if filtered is None else filtered + contrib
+        proj = self.proj(filtered)
+        values = proj[..., : self.out_dim]
+        gates = proj[..., self.out_dim :]
+        return values * mx.sigmoid(gates)
 
 
 class RepeatUpsample(nn.Module):
     def __init__(self, dim: int, out_dim: int):
         super().__init__()
         self.norm = RMSNormNoWeight()
+        self.out_dim = out_dim
         self.proj = CastedLinear(dim, out_dim)
+        self.phase_gate = CastedLinear(dim, 2)
+        self.phase_gate.weight = mx.zeros_like(self.phase_gate.weight)
+        self.phase_scales = mx.zeros((2, out_dim), dtype=mx.float32)
+        self.phase_biases = mx.zeros((2, out_dim), dtype=mx.float32)
 
     def __call__(self, x: mx.array, target_len: int) -> mx.array:
-        x = self.proj(self.norm(x))
-        x = mx.repeat(x, 2, axis=1)
-        return x[:, :target_len, :]
+        x = self.norm(x)
+        base = self.proj(x)
+        phase_gates = mx.sigmoid(self.phase_gate(x).astype(x.dtype))[..., None]
+        phase_scales = (1.0 + 0.5 * mx.tanh(self.phase_scales).astype(x.dtype))[None, None, :, :]
+        phase_biases = self.phase_biases.astype(x.dtype)[None, None, :, :]
+        upsampled = base[:, :, None, :] * phase_scales
+        upsampled = upsampled * phase_gates + phase_biases
+        return upsampled.reshape(x.shape[0], -1, self.out_dim)[:, :target_len, :]
 
 
 class GPT(nn.Module):
@@ -432,7 +458,7 @@ class GPT(nn.Module):
     # - low-resolution bottleneck
     # - repeat upsample + gated full-resolution decoder
     # - tied embeddings for the LM head (the baseline default setup)
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, bottleneck_dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+    def __init__(self, vocab_size: int, num_layers: int, dim: int, bottleneck_dim: int, unet_resample_kernel: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, skip_gate_init: float, skip_softcap: float,
                  rope_base: float, tied_embed_init_std: float, qk_gain_init: float):
         super().__init__()
@@ -442,6 +468,8 @@ class GPT(nn.Module):
             raise ValueError(f"skip_softcap must be positive, got {skip_softcap}")
         if bottleneck_dim <= 0:
             raise ValueError(f"bottleneck_dim must be positive, got {bottleneck_dim}")
+        if unet_resample_kernel < 2:
+            raise ValueError(f"unet_resample_kernel must be at least 2, got {unet_resample_kernel}")
         self.num_layers = num_layers
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
@@ -457,7 +485,7 @@ class GPT(nn.Module):
             Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
             for _ in range(self.num_encoder_layers)
         ]
-        self.downsample = CausalDownsample(dim, bottleneck_dim)
+        self.downsample = CausalDownsample(dim, bottleneck_dim, unet_resample_kernel)
         self.bottleneck_blocks = [
             Block(bottleneck_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
             for _ in range(self.num_bottleneck_layers)
@@ -978,6 +1006,7 @@ def main() -> None:
         num_layers=args.num_layers,
         dim=args.model_dim,
         bottleneck_dim=args.bottleneck_dim,
+        unet_resample_kernel=args.unet_resample_kernel,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,

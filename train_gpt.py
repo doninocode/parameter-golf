@@ -65,6 +65,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     bottleneck_dim = int(os.environ.get("BOTTLENECK_DIM", os.environ.get("MODEL_DIM", 512)))
+    unet_resample_kernel = int(os.environ.get("UNET_RESAMPLE_KERNEL", 4))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -299,7 +300,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gate,skip_gates",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gate,skip_gates,filter_logit,filter_logits,phase_scale,phase_scales,phase_bias,phase_biases,phase_gate",
     ).split(",")
     if pattern
 )
@@ -677,32 +678,54 @@ def unet_stage_counts(num_layers: int) -> tuple[int, int, int]:
 
 
 class CausalDownsample(nn.Module):
-    # Halve sequence length causally by pairing each even-position token with its
-    # immediate predecessor. Low-res token n therefore only sees positions <= 2n.
-    def __init__(self, dim: int, out_dim: int):
+    # Halve sequence length with a small learned causal filter before a GLU projection.
+    def __init__(self, dim: int, out_dim: int, kernel_size: int):
         super().__init__()
+        if kernel_size < 2:
+            raise ValueError(f"kernel_size must be at least 2, got {kernel_size}")
         self.norm = RMSNorm()
-        self.proj = CastedLinear(2 * dim, out_dim, bias=False)
+        self.kernel_size = kernel_size
+        self.out_dim = out_dim
+        self.proj = CastedLinear(dim, 2 * out_dim, bias=False)
+        filter_init = torch.zeros(kernel_size, dim, dtype=torch.float32)
+        filter_init[-1].fill_(2.0)
+        filter_init[-2].fill_(1.0)
+        self.filter_logits = nn.Parameter(filter_init)
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.norm(x)
-        current = x[:, 0::2, :]
-        prev = x[:, 1::2, :]
-        prev = F.pad(prev, (0, 0, 1, 0))[:, : current.size(1), :]
-        return self.proj(torch.cat((prev, current), dim=-1))
+        out_len = (x.size(1) + 1) // 2
+        padded = F.pad(x, (0, 0, self.kernel_size - 1, 0))
+        weights = torch.softmax(self.filter_logits, dim=0).to(dtype=x.dtype)
+        filtered = padded[:, : 2 * out_len : 2, :] * weights[0][None, None, :]
+        for tap in range(1, self.kernel_size):
+            filtered = filtered + padded[:, tap : tap + 2 * out_len : 2, :] * weights[tap][None, None, :]
+        values, gates = self.proj(filtered).split(self.out_dim, dim=-1)
+        return values * torch.sigmoid(gates)
 
 
 class RepeatUpsample(nn.Module):
-    # Restore full resolution by projecting low-res features and repeating each
-    # token over its 2-position causal window.
+    # Restore full resolution with phase-aware gating so even/odd positions can
+    # diverge without paying for two full projection matrices.
     def __init__(self, dim: int, out_dim: int):
         super().__init__()
         self.norm = RMSNorm()
+        self.out_dim = out_dim
         self.proj = CastedLinear(dim, out_dim, bias=False)
+        self.phase_gate = CastedLinear(dim, 2, bias=False)
+        self.phase_gate._zero_init = True
+        self.phase_scales = nn.Parameter(torch.zeros(2, out_dim, dtype=torch.float32))
+        self.phase_biases = nn.Parameter(torch.zeros(2, out_dim, dtype=torch.float32))
 
     def forward(self, x: Tensor, target_len: int) -> Tensor:
-        x = self.proj(self.norm(x))
-        return x.repeat_interleave(2, dim=1)[:, :target_len, :]
+        x = self.norm(x)
+        base = self.proj(x)
+        phase_gates = torch.sigmoid(self.phase_gate(x).to(dtype=x.dtype))[..., None]
+        phase_scales = (1.0 + 0.5 * torch.tanh(self.phase_scales).to(dtype=x.dtype))[None, None, :, :]
+        phase_biases = self.phase_biases.to(dtype=x.dtype)[None, None, :, :]
+        upsampled = base[:, :, None, :] * phase_scales
+        upsampled = upsampled * phase_gates + phase_biases
+        return upsampled.reshape(x.size(0), -1, self.out_dim)[:, :target_len, :]
 
 
 class GPT(nn.Module):
@@ -712,6 +735,7 @@ class GPT(nn.Module):
         num_layers: int,
         model_dim: int,
         bottleneck_dim: int,
+        unet_resample_kernel: int,
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
@@ -730,6 +754,8 @@ class GPT(nn.Module):
             raise ValueError(f"skip_softcap must be positive, got {skip_softcap}")
         if bottleneck_dim <= 0:
             raise ValueError(f"bottleneck_dim must be positive, got {bottleneck_dim}")
+        if unet_resample_kernel < 2:
+            raise ValueError(f"unet_resample_kernel must be at least 2, got {unet_resample_kernel}")
         self.num_layers = num_layers
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
@@ -748,7 +774,7 @@ class GPT(nn.Module):
         self.encoder_blocks = nn.ModuleList(
             [Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init) for _ in range(self.num_encoder_layers)]
         )
-        self.downsample = CausalDownsample(model_dim, bottleneck_dim)
+        self.downsample = CausalDownsample(model_dim, bottleneck_dim, unet_resample_kernel)
         self.bottleneck_blocks = nn.ModuleList(
             [Block(bottleneck_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init) for _ in range(self.num_bottleneck_layers)]
         )
@@ -1146,6 +1172,7 @@ def main() -> None:
         num_layers=args.num_layers,
         model_dim=args.model_dim,
         bottleneck_dim=args.bottleneck_dim,
+        unet_resample_kernel=args.unet_resample_kernel,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
