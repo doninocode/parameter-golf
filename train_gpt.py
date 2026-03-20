@@ -27,6 +27,9 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from artifact_torch import dequantize_state_dict_artifact, quantize_state_dict_artifact
+from lowbit_torch import BITNET_SCALE_EPS, BitLinear, collect_bitlinear_weight_names
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -96,6 +99,11 @@ class Hyperparameters:
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 256))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
+
+
+LINEAR_IMPL = os.environ.get("LINEAR_IMPL", "float")
+if LINEAR_IMPL not in {"float", "bitnet"}:
+    raise ValueError(f"LINEAR_IMPL must be 'float' or 'bitnet', got {LINEAR_IMPL!r}")
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -318,120 +326,6 @@ INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
-def tensor_nbytes(t: Tensor) -> int:
-    return int(t.numel()) * int(t.element_size())
-
-def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
-        return t.float().contiguous()
-    if t.dtype in {torch.float32, torch.bfloat16}:
-        passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
-        return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
-    return t
-
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
-    t32 = t.float()
-    if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
-
-    # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
-    return q, scale
-
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    # Single supported clean-script export format:
-    # - per-row int8 for 2D float tensors
-    # - per-tensor int8 for other float tensors
-    # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
-    quantized: dict[str, Tensor] = {}
-    scales: dict[str, Tensor] = {}
-    dtypes: dict[str, str] = {}
-    passthrough: dict[str, Tensor] = {}
-    passthrough_orig_dtypes: dict[str, str] = {}
-    qmeta: dict[str, dict[str, object]] = {}
-    stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
-        0,
-    )
-
-    for name, tensor in state_dict.items():
-        t = tensor.detach().to("cpu").contiguous()
-        stats["param_count"] += int(t.numel())
-        stats["num_tensors"] += 1
-        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
-
-        if not t.is_floating_point():
-            stats["num_nonfloat_tensors"] += 1
-            passthrough[name] = t
-            stats["int8_payload_bytes"] += tensor_nbytes(t)
-            continue
-
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
-            passthrough[name] = kept
-            stats["int8_payload_bytes"] += tensor_nbytes(kept)
-            continue
-
-        stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
-        quantized[name] = q
-        scales[name] = s
-        dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
-
-    obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
-        "quantized": quantized,
-        "scales": scales,
-        "dtypes": dtypes,
-        "passthrough": passthrough,
-    }
-    if qmeta:
-        obj["qmeta"] = qmeta
-    if passthrough_orig_dtypes:
-        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
-    return obj, stats
-
-def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
-    out: dict[str, Tensor] = {}
-    qmeta = obj.get("qmeta", {})
-    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
-    for name, q in obj["quantized"].items():
-        dtype = getattr(torch, obj["dtypes"][name])
-        s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
-            s = s.to(dtype=torch.float32)
-            # Broadcast the saved row scale back across trailing dimensions.
-            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
-        else:
-            scale = float(s.item())
-            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
-    for name, t in obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
-        out_t = t.detach().to("cpu").contiguous()
-        orig_dtype = passthrough_orig_dtypes.get(name)
-        if isinstance(orig_dtype, str):
-            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
-        out[name] = out_t
-    return out
-
 
 # -----------------------------
 # DATA LOADING 
@@ -524,6 +418,10 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+def build_trunk_linear(in_features: int, out_features: int, bias: bool = False) -> nn.Module:
+    return BitLinear(in_features, out_features, bias=bias, scale_eps=BITNET_SCALE_EPS) if LINEAR_IMPL == "bitnet" else CastedLinear(in_features, out_features, bias=bias)
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -583,10 +481,10 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
+        self.c_q = build_trunk_linear(dim, dim, bias=False)
+        self.c_k = build_trunk_linear(dim, kv_dim, bias=False)
+        self.c_v = build_trunk_linear(dim, kv_dim, bias=False)
+        self.proj = build_trunk_linear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
@@ -622,8 +520,8 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.fc = build_trunk_linear(dim, hidden, bias=False)
+        self.proj = build_trunk_linear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -686,7 +584,7 @@ class CausalDownsample(nn.Module):
         self.norm = RMSNorm()
         self.kernel_size = kernel_size
         self.out_dim = out_dim
-        self.proj = CastedLinear(dim, 2 * out_dim, bias=False)
+        self.proj = build_trunk_linear(dim, 2 * out_dim, bias=False)
         filter_init = torch.zeros(kernel_size, dim, dtype=torch.float32)
         filter_init[-1].fill_(2.0)
         filter_init[-2].fill_(1.0)
@@ -711,7 +609,7 @@ class RepeatUpsample(nn.Module):
         super().__init__()
         self.norm = RMSNorm()
         self.out_dim = out_dim
-        self.proj = CastedLinear(dim, out_dim, bias=False)
+        self.proj = build_trunk_linear(dim, out_dim, bias=False)
         self.phase_gate = CastedLinear(dim, 2, bias=False)
         self.phase_gate._zero_init = True
         self.phase_scales = nn.Parameter(torch.zeros(2, out_dim, dtype=torch.float32))
@@ -807,7 +705,7 @@ class GPT(nn.Module):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
-            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
+            if getattr(module, "_zero_init", False) and hasattr(module, "weight"):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor, lora=None) -> Tensor:
@@ -1185,7 +1083,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
-        if isinstance(module, CastedLinear):
+        if isinstance(module, (CastedLinear, BitLinear)):
             module.float()
         if isinstance(module, Rotary):
             module.inv_freq.data = module.inv_freq.data.float()
@@ -1248,7 +1146,7 @@ def main() -> None:
         f"architecture:causal_unet encoder_layers:{base_model.num_encoder_layers} "
         f"bottleneck_layers:{base_model.num_bottleneck_layers} decoder_layers:{base_model.num_decoder_layers} "
         f"model_dim:{args.model_dim} bottleneck_dim:{args.bottleneck_dim} "
-        f"skip_fusion:tanh_gate skip_softcap:{args.skip_softcap}"
+        f"skip_fusion:tanh_gate skip_softcap:{args.skip_softcap} linear_impl:{LINEAR_IMPL}"
     )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1429,30 +1327,43 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
-    quant_raw_bytes = len(quant_raw)
+    bitlinear_names = collect_bitlinear_weight_names(base_model)
+    artifact_obj, artifact_stats = quantize_state_dict_artifact(
+        base_model.state_dict(),
+        bitlinear_names=bitlinear_names,
+        fp32_name_patterns=INT8_KEEP_FLOAT_FP32_NAME_PATTERNS,
+        keep_float_max_numel=INT8_KEEP_FLOAT_MAX_NUMEL,
+        keep_float_store_dtype=INT8_KEEP_FLOAT_STORE_DTYPE,
+        per_row_scale_dtype=INT8_PER_ROW_SCALE_DTYPE,
+        clip_q=INT8_CLIP_Q,
+        scale_eps=BITNET_SCALE_EPS,
+    )
+    artifact_buf = io.BytesIO()
+    torch.save(artifact_obj, artifact_buf)
+    artifact_raw = artifact_buf.getvalue()
+    artifact_blob = zlib.compress(artifact_raw, level=9)
+    artifact_raw_bytes = len(artifact_raw)
+    artifact_fmt = artifact_obj["__quant_format__"]
+    artifact_tag = "bitnet_sign_zlib" if artifact_fmt == "bitnet_sign_rowpack_v1" else "int8_zlib"
+    artifact_file = "final_model.bit.ptz" if artifact_fmt == "bitnet_sign_rowpack_v1" else "final_model.int8.ptz"
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
-            f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        with open(artifact_file, "wb") as f:
+            f.write(artifact_blob)
+        quant_file_bytes = os.path.getsize(artifact_file)
         code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        ratio = artifact_stats["baseline_tensor_bytes"] / max(artifact_stats["payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            f"Serialized model {artifact_tag}: {quant_file_bytes} bytes "
+            f"(payload:{artifact_stats['payload_bytes']} raw_torch:{artifact_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size {artifact_tag}: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open(artifact_file, "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    base_model.load_state_dict(dequantize_state_dict_artifact(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1469,10 +1380,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_{artifact_tag}_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_{artifact_tag}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     # LoRA test-time training evaluation (the competition score)
     torch._dynamo.reset()
